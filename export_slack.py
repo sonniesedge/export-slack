@@ -3,7 +3,7 @@
 export_slack.py — Export a Slack channel to CSV, JSON, and download files.
 
 Usage:
-    uv run export_slack.py <channel> [--token TOKEN] [--output PATH]
+    uv run export_slack.py <channel> [--token TOKEN] [--output PATH] [--verbose]
 """
 
 import csv
@@ -35,6 +35,19 @@ BASE_DELAY = 1.0      # seconds between API calls
 JITTER_MAX = 0.25     # max extra random seconds added to each delay
 
 # ---------------------------------------------------------------------------
+# Verbose logging
+# ---------------------------------------------------------------------------
+
+_verbose: bool = False
+
+
+def vlog(msg: str) -> None:
+    """Print msg only when --verbose is active."""
+    if _verbose:
+        click.echo(f"  [verbose] {msg}")
+
+
+# ---------------------------------------------------------------------------
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
 
@@ -42,8 +55,10 @@ JITTER_MAX = 0.25     # max extra random seconds added to each delay
 def load_checkpoint(output_dir: Path) -> dict:
     path = output_dir / CHECKPOINT_FILE
     if path.exists():
+        vlog(f"Loading checkpoint from {path}")
         with open(path) as f:
             return json.load(f)
+    vlog("No checkpoint found, starting fresh.")
     return {
         "channel_id": None,
         "channel_name": None,
@@ -59,6 +74,7 @@ def load_checkpoint(output_dir: Path) -> dict:
 def save_checkpoint(output_dir: Path, checkpoint: dict) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / CHECKPOINT_FILE
+    vlog(f"Saving checkpoint ({checkpoint.get('messages_fetched', 0)} messages so far)")
     with open(path, "w") as f:
         json.dump(checkpoint, f, indent=2)
 
@@ -70,11 +86,14 @@ def save_checkpoint(output_dir: Path, checkpoint: dict) -> None:
 
 def pace() -> None:
     """Sleep BASE_DELAY + random jitter to stay within Slack's rate limits."""
-    time.sleep(BASE_DELAY + random.uniform(0, JITTER_MAX))
+    delay = BASE_DELAY + random.uniform(0, JITTER_MAX)
+    vlog(f"Pacing: sleeping {delay:.2f}s")
+    time.sleep(delay)
 
 
 def with_retry(fn, *args, max_retries: int = 8, **kwargs):
     """Call fn(*args, **kwargs) with exponential back-off on rate limits."""
+    vlog(f"API call: {fn.__name__} {kwargs}")
     delay = 1.0
     for attempt in range(max_retries):
         try:
@@ -97,6 +116,7 @@ def resolve_channel(client: WebClient, channel_arg: str) -> tuple[str, str]:
     """Return (channel_id, channel_name) from a channel name or ID."""
     # Already an ID?
     if re.match(r"^[CG][A-Z0-9]+$", channel_arg, re.IGNORECASE):
+        vlog(f"'{channel_arg}' looks like a channel ID, calling conversations.info")
         info = with_retry(client.conversations_info, channel=channel_arg)
         pace()
         name = info["channel"]["name"]
@@ -104,8 +124,12 @@ def resolve_channel(client: WebClient, channel_arg: str) -> tuple[str, str]:
 
     # Search by name (strip leading #)
     name_search = channel_arg.lstrip("#")
+    vlog(f"Searching for channel by name '{name_search}' via conversations.list")
     cursor = None
+    page = 0
     while True:
+        page += 1
+        vlog(f"conversations.list page {page}")
         resp = with_retry(
             client.conversations_list,
             types="public_channel,private_channel",
@@ -115,6 +139,7 @@ def resolve_channel(client: WebClient, channel_arg: str) -> tuple[str, str]:
         pace()
         for ch in resp["channels"]:
             if ch["name"] == name_search:
+                vlog(f"Found channel: {ch['id']}")
                 return ch["id"], ch["name"]
         cursor = resp.get("response_metadata", {}).get("next_cursor")
         if not cursor:
@@ -126,7 +151,9 @@ def resolve_channel(client: WebClient, channel_arg: str) -> tuple[str, str]:
 def resolve_user(client: WebClient, user_id: str, users_cache: dict) -> str:
     """Return the display name for a user ID, caching results."""
     if user_id in users_cache:
+        vlog(f"User {user_id} already in cache: '{users_cache[user_id]}'")
         return users_cache[user_id]
+    vlog(f"Resolving user {user_id} via users.info")
     try:
         resp = with_retry(client.users_info, user=user_id)
         pace()
@@ -134,6 +161,7 @@ def resolve_user(client: WebClient, user_id: str, users_cache: dict) -> str:
         name = profile.get("real_name") or profile.get("display_name") or user_id
     except Exception:
         name = f"<@{user_id}>"
+    vlog(f"Resolved {user_id} -> '{name}'")
     users_cache[user_id] = name
     return name
 
@@ -155,9 +183,11 @@ def fetch_all_messages(
     """
     messages_path = output_dir / MESSAGES_JSON
     if messages_path.exists():
+        vlog(f"Loading existing messages from {messages_path}")
         with open(messages_path) as f:
             data = json.load(f)
             messages: list[dict] = data.get("messages", [])
+        vlog(f"Loaded {len(messages)} messages from disk")
     else:
         messages = []
 
@@ -181,6 +211,9 @@ def fetch_all_messages(
         pace()
 
         batch = resp.get("messages", [])
+        vlog(f"Page {page}: received {len(batch)} messages")
+        for msg in batch:
+            vlog(f"  ts={msg.get('ts')} user={msg.get('user')} text={msg.get('text', '')[:60]!r}")
         messages.extend(batch)
         checkpoint["messages_fetched"] = len(messages)
 
@@ -229,10 +262,14 @@ def fetch_thread_replies(
     fetched_count = 0
     for parent in parents:
         thread_ts = parent["ts"]
+        vlog(f"Fetching thread ts={thread_ts} ({parent.get('reply_count')} replies) "
+             f"text={parent.get('text', '')[:60]!r}")
         replies: list[dict] = []
         cursor = None
+        page = 0
 
         while True:
+            page += 1
             resp = with_retry(
                 client.conversations_replies,
                 channel=channel_id,
@@ -243,15 +280,18 @@ def fetch_thread_replies(
             pace()
             # First message in replies is the parent itself — skip it
             batch = resp.get("messages", [])[1:]
+            vlog(f"  Thread page {page}: {len(batch)} replies")
             replies.extend(batch)
             cursor = resp.get("response_metadata", {}).get("next_cursor")
             if not resp.get("has_more") or not cursor:
                 break
 
+        vlog(f"  Total replies fetched for thread {thread_ts}: {len(replies)}")
         parent["thread_replies"] = replies
 
         already_fetched.add(thread_ts)
         fetched_count += 1
+        click.echo(f"  Thread {fetched_count}/{len(parents)} done ({len(replies)} replies)")
 
         if fetched_count % 10 == 0 or fetched_count == len(parents):
             checkpoint["fetched_thread_ts"] = list(already_fetched)
@@ -299,12 +339,15 @@ def download_files(
 
     click.echo(f"  Downloading {len(pending)} file(s)...")
 
-    for file_obj in pending:
+    for i, file_obj in enumerate(pending, 1):
         file_id = file_obj["id"]
         filetype = file_obj.get("filetype") or Path(file_obj.get("name", "bin")).suffix.lstrip(".")
         filename = f"{file_id}.{filetype}" if filetype else file_id
         dest = files_dir / filename
         url = file_obj["url_private"]
+
+        vlog(f"File {i}/{len(pending)}: {filename} ({file_obj.get('pretty_type', '')} "
+             f"{file_obj.get('size', '')} bytes) from {url}")
 
         try:
             req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
@@ -339,6 +382,7 @@ def _all_messages(messages: list[dict]):
 def _write_json(output_dir: Path, messages: list[dict], users: dict) -> None:
     path = output_dir / MESSAGES_JSON
     output_dir.mkdir(parents=True, exist_ok=True)
+    vlog(f"Writing {path} ({len(messages)} messages)")
     with open(path, "w") as f:
         json.dump({"messages": messages, "users": users}, f, indent=2)
 
@@ -384,6 +428,7 @@ def write_csv(output_dir: Path, messages: list[dict], users_cache: dict) -> None
     Thread replies:     4 columns — timestamp, author, "", text
     """
     path = output_dir / MESSAGES_CSV
+    vlog(f"Writing {path}")
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         for msg in messages:
@@ -393,10 +438,12 @@ def write_csv(output_dir: Path, messages: list[dict], users_cache: dict) -> None
                 author,
                 _message_text(msg, users_cache),
             ]
+            vlog(f"CSV row: ts={row[0]} author={row[1]} text={str(row[2])[:60]!r}")
             writer.writerow(row)
 
             for reply in msg.get("thread_replies", []):
                 reply_author = users_cache.get(reply.get("user", ""), reply.get("username") or reply.get("user", ""))
+                vlog(f"  CSV reply: ts={_format_ts(reply.get('ts',''))} author={reply_author}")
                 writer.writerow([
                     _format_ts(reply.get("ts", "")),
                     reply_author,
@@ -432,6 +479,7 @@ def resolve_all_users(
 
     unknown = [uid for uid in user_ids if uid not in users_cache]
     if not unknown:
+        click.echo("  All users already resolved (checkpoint).")
         return users_cache
 
     click.echo(f"  Resolving {len(unknown)} user(s)...")
@@ -462,11 +510,20 @@ def resolve_all_users(
     default=None,
     help="Output directory. Defaults to downloads/<channel_name>.",
 )
-def main(channel: str, token: str, output: str | None) -> None:
+@click.option(
+    "--verbose", "-v",
+    is_flag=True,
+    default=False,
+    help="Enable verbose output (API calls, pacing, per-message detail).",
+)
+def main(channel: str, token: str, output: str | None, verbose: bool) -> None:
     """Export a Slack CHANNEL to CSV, JSON, and download its files.
 
     CHANNEL can be a channel name (e.g. general) or a channel ID (e.g. C01234ABC).
     """
+    global _verbose
+    _verbose = verbose
+
     client = WebClient(token=token)
 
     # Resolve channel
