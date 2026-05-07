@@ -97,7 +97,7 @@ def resolve_channel(client: WebClient, channel_arg: str) -> tuple[str, str]:
     """Return (channel_id, channel_name) from a channel name or ID."""
     # Already an ID?
     if re.match(r"^[CG][A-Z0-9]+$", channel_arg, re.IGNORECASE):
-        info = client.conversations_info(channel=channel_arg)
+        info = with_retry(client.conversations_info, channel=channel_arg)
         pace()
         name = info["channel"]["name"]
         return channel_arg, name
@@ -106,7 +106,8 @@ def resolve_channel(client: WebClient, channel_arg: str) -> tuple[str, str]:
     name_search = channel_arg.lstrip("#")
     cursor = None
     while True:
-        resp = client.conversations_list(
+        resp = with_retry(
+            client.conversations_list,
             types="public_channel,private_channel",
             limit=200,
             cursor=cursor,
