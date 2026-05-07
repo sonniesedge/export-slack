@@ -9,6 +9,7 @@ Usage:
 import csv
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -26,6 +27,11 @@ CHECKPOINT_FILE = ".checkpoint.json"
 MESSAGES_JSON = "messages.json"
 MESSAGES_CSV = "messages.csv"
 FILES_DIR = "files"
+
+# Proactive rate-limit pacing: Slack recommends ≤1 req/s as a safe baseline.
+# We sleep BASE_DELAY seconds between requests, plus a small random jitter.
+BASE_DELAY = 1.0      # seconds between API calls
+JITTER_MAX = 0.25     # max extra random seconds added to each delay
 
 # CSV columns derived from the raw message payload
 CSV_COLUMNS = [
@@ -77,11 +83,17 @@ def save_checkpoint(output_dir: Path, checkpoint: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
+def pace() -> None:
+    """Sleep BASE_DELAY + random jitter to stay within Slack's rate limits."""
+    time.sleep(BASE_DELAY + random.uniform(0, JITTER_MAX))
+
+
 def resolve_channel(client: WebClient, channel_arg: str) -> tuple[str, str]:
     """Return (channel_id, channel_name) from a channel name or ID."""
     # Already an ID?
     if re.match(r"^[CG][A-Z0-9]+$", channel_arg, re.IGNORECASE):
         info = client.conversations_info(channel=channel_arg)
+        pace()
         name = info["channel"]["name"]
         return channel_arg, name
 
@@ -94,6 +106,7 @@ def resolve_channel(client: WebClient, channel_arg: str) -> tuple[str, str]:
             limit=200,
             cursor=cursor,
         )
+        pace()
         for ch in resp["channels"]:
             if ch["name"] == name_search:
                 return ch["id"], ch["name"]
@@ -164,6 +177,7 @@ def fetch_all_messages(
             limit=200,
             cursor=cursor,
         )
+        pace()
 
         batch = resp.get("messages", [])
         messages.extend(batch)
@@ -228,6 +242,7 @@ def fetch_thread_replies(
                 limit=200,
                 cursor=cursor,
             )
+            pace()
             # First message in replies is the parent itself — skip it
             batch = resp.get("messages", [])[1:]
             replies.extend(batch)
