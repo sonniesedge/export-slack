@@ -459,7 +459,7 @@ def resolve_all_users(
 @click.option(
     "--output",
     default=None,
-    help="Output directory. Defaults to downloads/<channel_id>.",
+    help="Output directory. Defaults to downloads/<channel_name>.",
 )
 def main(channel: str, token: str, output: str | None) -> None:
     """Export a Slack CHANNEL to CSV, JSON, and download its files.
@@ -473,8 +473,8 @@ def main(channel: str, token: str, output: str | None) -> None:
     channel_id, channel_name = resolve_channel(client, channel)
     click.echo(f"  Channel: #{channel_name} ({channel_id})")
 
-    # Determine output directory (named after channel ID, matching reference tool)
-    output_dir = Path(output) if output else Path("downloads") / channel_id
+    # Determine output directory
+    output_dir = Path(output) if output else Path("downloads") / channel_name
     output_dir.mkdir(parents=True, exist_ok=True)
     click.echo(f"  Output directory: {output_dir.resolve()}")
 
