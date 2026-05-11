@@ -325,11 +325,18 @@ def fetch_all_messages(
     existing: dict[str, dict] = {}
     if messages_path.exists():
         vlog(f"Loading existing messages from {messages_path}")
-        with open(messages_path) as f:
-            data = json.load(f)
-        for m in data.get("messages", []):
-            existing[m["ts"]] = m
-        vlog(f"Loaded {len(existing)} messages from disk")
+        try:
+            with open(messages_path) as f:
+                data = json.load(f)
+            for m in data.get("messages", []):
+                existing[m["ts"]] = m
+            vlog(f"Loaded {len(existing)} messages from disk")
+        except (json.JSONDecodeError, OSError) as exc:
+            click.echo(
+                f"  Warning: {messages_path} is corrupt ({exc}); starting from scratch.",
+                err=True,
+            )
+            messages_path.unlink(missing_ok=True)
 
     # Determine the starting point for this fetch.
     last_ts = checkpoint.get("last_export_ts")
@@ -594,10 +601,12 @@ def write_metadata(output_dir: Path, channel_info: dict, message_count: int) -> 
 
 def _write_json(output_dir: Path, messages: list[dict], users: dict) -> None:
     path = output_dir / MESSAGES_JSON
+    tmp = path.with_suffix(".tmp")
     output_dir.mkdir(parents=True, exist_ok=True)
     vlog(f"Writing {path} ({len(messages)} messages)")
-    with open(path, "w") as f:
+    with open(tmp, "w") as f:
         json.dump({"messages": messages, "users": users}, f, indent=2)
+    tmp.replace(path)
 
 
 def _format_ts(ts: str) -> str:
