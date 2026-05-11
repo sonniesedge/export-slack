@@ -27,6 +27,7 @@ from slack_sdk.errors import SlackApiError
 CHECKPOINT_FILE = ".checkpoint.json"
 MESSAGES_JSON = "messages.json"
 MESSAGES_CSV = "messages.csv"
+METADATA_JSON = "metadata.json"
 FILES_DIR = "files"
 
 # Proactive rate-limit pacing: Slack recommends ≤1 req/s as a safe baseline.
@@ -91,14 +92,21 @@ def pace() -> None:
     time.sleep(delay)
 
 
-def with_retry(fn, *args, max_retries: int = 8, **kwargs):
-    """Call fn(*args, **kwargs) with exponential back-off on rate limits."""
+def with_retry(fn, *args, max_retries: int = 8, client: "WebClient | None" = None, **kwargs):
+    """Call fn(*args, **kwargs) with exponential back-off on rate limits.
+
+    If the Slack API returns 'not_in_channel' and a ``client`` is provided along
+    with a ``channel`` kwarg, the bot will attempt to join the channel once and
+    then retry the original call.
+    """
     vlog(f"API call: {fn.__name__} {kwargs}")
     delay = 1.0
+    joined_channel = False
     for attempt in range(max_retries):
         try:
             return fn(*args, **kwargs)
         except SlackApiError as e:
+            error_code = e.response.get("error", "")
             if e.response.status_code == 429:
                 retry_after = int(e.response.headers.get("Retry-After", delay))
                 click.echo(
@@ -107,20 +115,40 @@ def with_retry(fn, *args, max_retries: int = 8, **kwargs):
                 )
                 time.sleep(retry_after)
                 delay = min(delay * 2, 60)
+            elif error_code == "not_in_channel" and client is not None and not joined_channel:
+                channel_id = kwargs.get("channel")
+                if channel_id:
+                    click.echo(
+                        f"  Bot is not in channel {channel_id}. "
+                        "Attempting to join automatically..."
+                    )
+                    try:
+                        client.conversations_join(channel=channel_id)
+                        joined_channel = True
+                        click.echo("  Joined channel. Retrying...")
+                    except SlackApiError as join_err:
+                        raise click.ClickException(
+                            f"Cannot join channel {channel_id}: "
+                            f"{join_err.response.get('error', join_err)}\n"
+                            "Ensure the bot has been invited to the channel or "
+                            "has the 'channels:join' scope."
+                        ) from join_err
+                else:
+                    raise
             else:
                 raise
     raise click.ClickException("Max retries exceeded due to rate limiting.")
 
 
-def resolve_channel(client: WebClient, channel_arg: str) -> tuple[str, str]:
-    """Return (channel_id, channel_name) from a channel name or ID."""
+def resolve_channel(client: WebClient, channel_arg: str) -> tuple[str, str, dict]:
+    """Return (channel_id, channel_name, channel_info) from a channel name or ID."""
     # Already an ID?
     if re.match(r"^[CG][A-Z0-9]+$", channel_arg, re.IGNORECASE):
         vlog(f"'{channel_arg}' looks like a channel ID, calling conversations.info")
         info = with_retry(client.conversations_info, channel=channel_arg)
         pace()
-        name = info["channel"]["name"]
-        return channel_arg, name
+        ch = info["channel"]
+        return ch["id"], ch["name"], ch
 
     # Search by name (strip leading #)
     name_search = channel_arg.lstrip("#")
@@ -139,8 +167,11 @@ def resolve_channel(client: WebClient, channel_arg: str) -> tuple[str, str]:
         pace()
         for ch in resp["channels"]:
             if ch["name"] == name_search:
-                vlog(f"Found channel: {ch['id']}")
-                return ch["id"], ch["name"]
+                vlog(f"Found channel: {ch['id']}, fetching full info")
+                info = with_retry(client.conversations_info, channel=ch["id"])
+                pace()
+                ch_full = info["channel"]
+                return ch_full["id"], ch_full["name"], ch_full
         cursor = resp.get("response_metadata", {}).get("next_cursor")
         if not cursor:
             break
@@ -207,6 +238,7 @@ def fetch_all_messages(
             channel=channel_id,
             limit=200,
             cursor=cursor,
+            client=client,
         )
         pace()
 
@@ -276,6 +308,7 @@ def fetch_thread_replies(
                 ts=thread_ts,
                 limit=200,
                 cursor=cursor,
+                client=client,
             )
             pace()
             # First message in replies is the parent itself — skip it
@@ -377,6 +410,51 @@ def _all_messages(messages: list[dict]):
 # ---------------------------------------------------------------------------
 # Export helpers
 # ---------------------------------------------------------------------------
+
+
+def write_metadata(output_dir: Path, channel_info: dict, message_count: int) -> None:
+    """Write channel metadata to metadata.json."""
+    ch = channel_info
+
+    def _ts(ts) -> str | None:
+        """Convert a Unix timestamp (int or float) to an ISO-8601 string."""
+        try:
+            return datetime.utcfromtimestamp(int(ts)).isoformat() + "Z"
+        except (TypeError, ValueError, OSError):
+            return None
+
+    creator_id = ch.get("creator")
+    purpose = ch.get("purpose", {})
+    topic = ch.get("topic", {})
+
+    metadata = {
+        "exported_at": datetime.utcnow().isoformat() + "Z",
+        "channel": {
+            "id": ch.get("id"),
+            "name": ch.get("name"),
+            "name_normalized": ch.get("name_normalized"),
+            "created_at": _ts(ch.get("created")),
+            "creator_id": creator_id,
+            "is_private": ch.get("is_private"),
+            "is_archived": ch.get("is_archived"),
+            "is_general": ch.get("is_general"),
+            "member_count": ch.get("num_members"),
+            "topic": topic.get("value") or None,
+            "topic_set_by": topic.get("creator") or None,
+            "topic_set_at": _ts(topic.get("last_set")) if topic.get("last_set") else None,
+            "purpose": purpose.get("value") or None,
+            "purpose_set_by": purpose.get("creator") or None,
+            "purpose_set_at": _ts(purpose.get("last_set")) if purpose.get("last_set") else None,
+        },
+        "export": {
+            "message_count": message_count,
+        },
+    }
+
+    path = output_dir / METADATA_JSON
+    with open(path, "w") as f:
+        json.dump(metadata, f, indent=2)
+    vlog(f"Wrote metadata to {path}")
 
 
 def _write_json(output_dir: Path, messages: list[dict], users: dict) -> None:
@@ -528,7 +606,7 @@ def main(channel: str, token: str, output: str | None, verbose: bool) -> None:
 
     # Resolve channel
     click.echo(f"Resolving channel '{channel}'...")
-    channel_id, channel_name = resolve_channel(client, channel)
+    channel_id, channel_name, channel_info = resolve_channel(client, channel)
     click.echo(f"  Channel: #{channel_name} ({channel_id})")
 
     # Determine output directory
@@ -562,8 +640,10 @@ def main(channel: str, token: str, output: str | None, verbose: bool) -> None:
     click.echo("\nWriting final exports...")
     _write_json(output_dir, messages, users_cache)
     write_csv(output_dir, messages, users_cache)
+    write_metadata(output_dir, channel_info, len(messages))
 
     click.echo(f"\nDone. {len(messages)} messages exported to {output_dir.resolve()}")
+    click.echo(f"  {output_dir / METADATA_JSON}")
     click.echo(f"  {output_dir / MESSAGES_JSON}")
     click.echo(f"  {output_dir / MESSAGES_CSV}")
     click.echo(f"  {output_dir / FILES_DIR}/")
