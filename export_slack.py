@@ -59,8 +59,15 @@ def load_checkpoint(output_dir: Path) -> dict:
     path = output_dir / CHECKPOINT_FILE
     if path.exists():
         vlog(f"Loading checkpoint from {path}")
-        with open(path) as f:
-            return json.load(f)
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            click.echo(
+                f"  Warning: checkpoint at {path} is corrupt ({exc}); starting fresh.",
+                err=True,
+            )
+            path.unlink(missing_ok=True)
     vlog("No checkpoint found, starting fresh.")
     return {
         "channel_id": None,
@@ -77,9 +84,11 @@ def load_checkpoint(output_dir: Path) -> dict:
 def save_checkpoint(output_dir: Path, checkpoint: dict) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / CHECKPOINT_FILE
+    tmp = path.with_suffix(".tmp")
     vlog(f"Saving checkpoint ({checkpoint.get('messages_fetched', 0)} messages so far)")
-    with open(path, "w") as f:
+    with open(tmp, "w") as f:
         json.dump(checkpoint, f, indent=2)
+    tmp.replace(path)
 
 
 # ---------------------------------------------------------------------------
@@ -594,8 +603,10 @@ def write_metadata(output_dir: Path, channel_info: dict, message_count: int) -> 
     }
 
     path = output_dir / METADATA_JSON
-    with open(path, "w") as f:
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w") as f:
         json.dump(metadata, f, indent=2)
+    tmp.replace(path)
     vlog(f"Wrote metadata to {path}")
 
 
