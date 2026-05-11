@@ -494,6 +494,13 @@ def fetch_thread_replies(
 # ---------------------------------------------------------------------------
 
 
+def _file_dest_name(file_obj: dict) -> str:
+    """Return the local filename for a Slack file object."""
+    file_id = file_obj["id"]
+    filetype = file_obj.get("filetype") or Path(file_obj.get("name", "bin")).suffix.lstrip(".")
+    return f"{file_id}.{filetype}" if filetype else file_id
+
+
 def download_files(
     client: WebClient,
     messages: list[dict],
@@ -516,7 +523,11 @@ def download_files(
             if isinstance(f, dict) and f.get("id") and f.get("url_private"):
                 all_file_objects.append(f)
 
-    pending = [f for f in all_file_objects if f["id"] not in downloaded]
+    pending = [
+        f for f in all_file_objects
+        if f["id"] not in downloaded
+        or not (files_dir / _file_dest_name(f)).exists()
+    ]
     if not pending:
         click.echo("  No new files to download.")
         return
@@ -525,8 +536,7 @@ def download_files(
 
     for i, file_obj in enumerate(pending, 1):
         file_id = file_obj["id"]
-        filetype = file_obj.get("filetype") or Path(file_obj.get("name", "bin")).suffix.lstrip(".")
-        filename = f"{file_id}.{filetype}" if filetype else file_id
+        filename = _file_dest_name(file_obj)
         dest = files_dir / filename
         url = file_obj["url_private"]
 
