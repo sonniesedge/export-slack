@@ -97,25 +97,33 @@ def load_channel_cache() -> dict:
     path = _cache_path()
     if path.exists():
         vlog(f"Loading channel cache from {path}")
-        with open(path) as f:
-            return json.load(f)
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            click.echo(
+                f"  Warning: channel cache at {path} is corrupt ({exc}); starting fresh.",
+                err=True,
+            )
+            path.unlink(missing_ok=True)
     vlog("No channel cache found, starting fresh.")
     return {"by_name": {}, "by_id": {}}
 
 
 def save_channel_cache(cache: dict) -> None:
-    """Persist the channel cache to disk."""
+    """Persist the channel cache to disk using an atomic write."""
     path = _cache_path()
-    with open(path, "w") as f:
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w") as f:
         json.dump(cache, f, indent=2, sort_keys=True)
+    tmp.replace(path)
     vlog(f"Saved channel cache ({len(cache['by_id'])} entries) to {path}")
 
 
 def update_channel_cache(cache: dict, channel_id: str, channel_name: str) -> None:
-    """Add or refresh a single entry in the cache and save."""
+    """Add or refresh a single entry in the in-memory cache (no disk write)."""
     cache["by_name"][channel_name] = channel_id
     cache["by_id"][channel_id] = channel_name
-    save_channel_cache(cache)
 
 
 def populate_channel_cache(client: WebClient) -> dict:
