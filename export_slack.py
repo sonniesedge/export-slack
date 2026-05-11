@@ -65,7 +65,7 @@ def load_checkpoint(output_dir: Path) -> dict:
     return {
         "channel_id": None,
         "channel_name": None,
-        "history_complete": False,
+        "last_export_ts": None,
         "next_cursor": None,
         "messages_fetched": 0,
         "downloaded_file_ids": [],
@@ -312,47 +312,63 @@ def fetch_all_messages(
     output_dir: Path,
 ) -> list[dict]:
     """
-    Fetch all top-level messages from the channel, resuming from checkpoint.
-    Returns the accumulated list of raw message dicts (no thread replies yet).
+    Fetch top-level messages from the channel.
+
+    - First run: fetches the full history.
+    - Subsequent runs: fetches only messages newer than ``last_export_ts``
+      stored in the checkpoint, then merges them into the existing messages
+      file (keyed by ``ts`` so duplicates are collapsed).
     """
     messages_path = output_dir / MESSAGES_JSON
+
+    # Load whatever we already have on disk (may be empty on first run).
+    existing: dict[str, dict] = {}
     if messages_path.exists():
         vlog(f"Loading existing messages from {messages_path}")
         with open(messages_path) as f:
             data = json.load(f)
-            messages: list[dict] = data.get("messages", [])
-        vlog(f"Loaded {len(messages)} messages from disk")
+        for m in data.get("messages", []):
+            existing[m["ts"]] = m
+        vlog(f"Loaded {len(existing)} messages from disk")
+
+    # Determine the starting point for this fetch.
+    last_ts = checkpoint.get("last_export_ts")
+    if last_ts:
+        click.echo(f"  Incremental mode: fetching messages since ts={last_ts}")
     else:
-        messages = []
+        click.echo("  Full fetch: no previous export timestamp found.")
 
-    if checkpoint.get("history_complete"):
-        click.echo("  Channel history already fully fetched (checkpoint). Skipping.")
-        return messages
-
+    # If a mid-run cursor was saved (interrupted full/incremental fetch),
+    # resume from there rather than restarting.
     cursor = checkpoint.get("next_cursor") or None
     page = 0
+    new_count = 0
 
     while True:
         page += 1
         click.echo(f"  Fetching history page {page}...")
 
-        resp = with_retry(
-            client.conversations_history,
-            channel=channel_id,
-            limit=200,
-            cursor=cursor,
-            client=client,
-        )
+        kwargs: dict = dict(channel=channel_id, limit=200, client=client)
+        if cursor:
+            kwargs["cursor"] = cursor
+        elif last_ts:
+            kwargs["oldest"] = last_ts
+
+        resp = with_retry(client.conversations_history, **kwargs)
         pace()
 
         batch = resp.get("messages", [])
         vlog(f"Page {page}: received {len(batch)} messages")
         for msg in batch:
             vlog(f"  ts={msg.get('ts')} user={msg.get('user')} text={msg.get('text', '')[:60]!r}")
-        messages.extend(batch)
-        checkpoint["messages_fetched"] = len(messages)
+            if msg["ts"] not in existing:
+                new_count += 1
+            existing[msg["ts"]] = msg
 
-        # Persist after every page so interruptions don't lose progress
+        checkpoint["messages_fetched"] = len(existing)
+
+        # Persist after every page so interruptions don't lose progress.
+        messages = sorted(existing.values(), key=lambda m: m["ts"])
         _write_json(output_dir, messages, checkpoint.get("users", {}))
         cursor = resp.get("response_metadata", {}).get("next_cursor")
         checkpoint["next_cursor"] = cursor
@@ -361,10 +377,14 @@ def fetch_all_messages(
         if not resp.get("has_more") or not cursor:
             break
 
-    checkpoint["history_complete"] = True
     checkpoint["next_cursor"] = None
     save_checkpoint(output_dir, checkpoint)
-    click.echo(f"  Fetched {len(messages)} top-level messages.")
+
+    messages = sorted(existing.values(), key=lambda m: m["ts"])
+    if last_ts:
+        click.echo(f"  {new_count} new message(s) fetched; {len(messages)} total.")
+    else:
+        click.echo(f"  Fetched {len(messages)} top-level messages.")
     return messages
 
 
@@ -377,16 +397,28 @@ def fetch_thread_replies(
 ) -> list[dict]:
     """
     For every thread parent, fetch all replies and nest them under the parent
-    as a `thread_replies` list. Returns the updated messages list.
+    as a ``thread_replies`` list. Returns the updated messages list.
+
+    On incremental runs, threads whose ``latest_reply`` timestamp is newer than
+    ``last_export_ts`` are re-fetched so new replies are captured.  Threads
+    with no new activity are left untouched.
     """
     already_fetched: set[str] = set(checkpoint.get("fetched_thread_ts", []))
+    last_ts = checkpoint.get("last_export_ts")
 
-    parents = [
-        m for m in messages
-        if m.get("reply_count", 0) > 0
-        and m.get("thread_ts") == m.get("ts")
-        and m["ts"] not in already_fetched
-    ]
+    def _needs_fetch(m: dict) -> bool:
+        if m.get("reply_count", 0) == 0:
+            return False
+        if m.get("thread_ts") != m.get("ts"):
+            return False
+        if m["ts"] not in already_fetched:
+            return True
+        # Re-fetch if there has been new reply activity since last export.
+        if last_ts and m.get("latest_reply", "0") > last_ts:
+            return True
+        return False
+
+    parents = [m for m in messages if _needs_fetch(m)]
 
     if not parents:
         click.echo("  No new threads to fetch.")
@@ -723,6 +755,16 @@ def export_channel(
     _write_json(output_dir, messages, users_cache)
     write_csv(output_dir, messages, users_cache)
     write_metadata(output_dir, channel_info, len(messages))
+
+    # Record the timestamp of the newest message so the next run knows where
+    # to start. Use the current time if there are no messages.
+    if messages:
+        newest_ts = max(m["ts"] for m in messages)
+    else:
+        newest_ts = str(time.time())
+    checkpoint["last_export_ts"] = newest_ts
+    checkpoint["next_cursor"] = None
+    save_checkpoint(output_dir, checkpoint)
 
     click.echo(f"\nDone. {len(messages)} messages exported to {output_dir.resolve()}")
     click.echo(f"  {output_dir / METADATA_JSON}")
