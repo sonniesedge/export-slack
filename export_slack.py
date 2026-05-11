@@ -29,6 +29,8 @@ MESSAGES_JSON = "messages.json"
 MESSAGES_CSV = "messages.csv"
 METADATA_JSON = "metadata.json"
 FILES_DIR = "files"
+CHANNEL_CACHE_FILE = ".channel_cache.json"
+DOWNLOADS_DIR = Path("downloads")
 
 # Proactive rate-limit pacing: Slack recommends ≤1 req/s as a safe baseline.
 # We sleep BASE_DELAY seconds between requests, plus a small random jitter.
@@ -78,6 +80,69 @@ def save_checkpoint(output_dir: Path, checkpoint: dict) -> None:
     vlog(f"Saving checkpoint ({checkpoint.get('messages_fetched', 0)} messages so far)")
     with open(path, "w") as f:
         json.dump(checkpoint, f, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Channel cache
+# ---------------------------------------------------------------------------
+
+
+def _cache_path() -> Path:
+    DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    return DOWNLOADS_DIR / CHANNEL_CACHE_FILE
+
+
+def load_channel_cache() -> dict:
+    """Load the channel name<->ID cache from disk, or return an empty cache."""
+    path = _cache_path()
+    if path.exists():
+        vlog(f"Loading channel cache from {path}")
+        with open(path) as f:
+            return json.load(f)
+    vlog("No channel cache found, starting fresh.")
+    return {"by_name": {}, "by_id": {}}
+
+
+def save_channel_cache(cache: dict) -> None:
+    """Persist the channel cache to disk."""
+    path = _cache_path()
+    with open(path, "w") as f:
+        json.dump(cache, f, indent=2, sort_keys=True)
+    vlog(f"Saved channel cache ({len(cache['by_id'])} entries) to {path}")
+
+
+def update_channel_cache(cache: dict, channel_id: str, channel_name: str) -> None:
+    """Add or refresh a single entry in the cache and save."""
+    cache["by_name"][channel_name] = channel_id
+    cache["by_id"][channel_id] = channel_name
+    save_channel_cache(cache)
+
+
+def populate_channel_cache(client: WebClient) -> dict:
+    """Fetch every channel the token can see and build a full cache."""
+    cache: dict = {"by_name": {}, "by_id": {}}
+    cursor = None
+    page = 0
+    total = 0
+    while True:
+        page += 1
+        vlog(f"conversations.list page {page} (cache population)")
+        resp = with_retry(
+            client.conversations_list,
+            types="public_channel,private_channel",
+            limit=200,
+            cursor=cursor,
+        )
+        pace()
+        for ch in resp.get("channels", []):
+            cache["by_name"][ch["name"]] = ch["id"]
+            cache["by_id"][ch["id"]] = ch["name"]
+            total += 1
+        cursor = resp.get("response_metadata", {}).get("next_cursor")
+        if not cursor:
+            break
+    save_channel_cache(cache)
+    return cache
 
 
 # ---------------------------------------------------------------------------
@@ -140,18 +205,45 @@ def with_retry(fn, *args, max_retries: int = 8, client: "WebClient | None" = Non
     raise click.ClickException("Max retries exceeded due to rate limiting.")
 
 
-def resolve_channel(client: WebClient, channel_arg: str) -> tuple[str, str, dict]:
-    """Return (channel_id, channel_name, channel_info) from a channel name or ID."""
+def resolve_channel(
+    client: WebClient,
+    channel_arg: str,
+    cache: dict | None = None,
+) -> tuple[str, str, dict]:
+    """Return (channel_id, channel_name, channel_info) from a channel name or ID.
+
+    If ``cache`` is provided it is used as a fast-path to skip the API lookup
+    where possible, and is updated with any newly resolved entries.
+    """
+    cache = cache if cache is not None else {"by_name": {}, "by_id": {}}
+
     # Already an ID?
     if re.match(r"^[CG][A-Z0-9]+$", channel_arg, re.IGNORECASE):
+        channel_id = channel_arg.upper()
+        # We still need full channel info, but we can log a cache hit for the name.
+        if channel_id in cache["by_id"]:
+            vlog(f"Cache hit: {channel_id} -> '{cache['by_id'][channel_id]}'")
         vlog(f"'{channel_arg}' looks like a channel ID, calling conversations.info")
-        info = with_retry(client.conversations_info, channel=channel_arg)
+        info = with_retry(client.conversations_info, channel=channel_id)
         pace()
         ch = info["channel"]
+        update_channel_cache(cache, ch["id"], ch["name"])
         return ch["id"], ch["name"], ch
 
     # Search by name (strip leading #)
     name_search = channel_arg.lstrip("#")
+
+    # Fast-path: name already in cache
+    if name_search in cache["by_name"]:
+        cached_id = cache["by_name"][name_search]
+        vlog(f"Cache hit: '{name_search}' -> {cached_id}, fetching full info")
+        info = with_retry(client.conversations_info, channel=cached_id)
+        pace()
+        ch = info["channel"]
+        update_channel_cache(cache, ch["id"], ch["name"])
+        return ch["id"], ch["name"], ch
+
+    # Fall back to paginated search
     vlog(f"Searching for channel by name '{name_search}' via conversations.list")
     cursor = None
     page = 0
@@ -166,11 +258,14 @@ def resolve_channel(client: WebClient, channel_arg: str) -> tuple[str, str, dict
         )
         pace()
         for ch in resp["channels"]:
+            # Opportunistically cache every channel we see
+            update_channel_cache(cache, ch["id"], ch["name"])
             if ch["name"] == name_search:
                 vlog(f"Found channel: {ch['id']}, fetching full info")
                 info = with_retry(client.conversations_info, channel=ch["id"])
                 pace()
                 ch_full = info["channel"]
+                update_channel_cache(cache, ch_full["id"], ch_full["name"])
                 return ch_full["id"], ch_full["name"], ch_full
         cursor = resp.get("response_metadata", {}).get("next_cursor")
         if not cursor:
@@ -579,16 +674,17 @@ def export_channel(
     client: WebClient,
     token: str,
     channel: str,
+    cache: dict,
     output: str | None = None,
 ) -> None:
     """Export a single channel. Shared by single and batch modes."""
     # Resolve channel
     click.echo(f"Resolving channel '{channel}'...")
-    channel_id, channel_name, channel_info = resolve_channel(client, channel)
+    channel_id, channel_name, channel_info = resolve_channel(client, channel, cache)
     click.echo(f"  Channel: #{channel_name} ({channel_id})")
 
     # Determine output directory
-    output_dir = Path(output) if output else Path("downloads") / channel_name
+    output_dir = Path(output) if output else DOWNLOADS_DIR / channel_name
     output_dir.mkdir(parents=True, exist_ok=True)
     click.echo(f"  Output directory: {output_dir.resolve()}")
 
@@ -627,14 +723,37 @@ def export_channel(
     click.echo(f"  {output_dir / FILES_DIR}/")
 
 
-@click.command()
-@click.argument("channel", required=False)
-@click.option(
+# ---------------------------------------------------------------------------
+# Shared CLI options
+# ---------------------------------------------------------------------------
+
+_token_option = click.option(
     "--token",
     envvar="SLACK_API_TOKEN",
     required=True,
     help="Slack API token (or set SLACK_API_TOKEN env var).",
 )
+_verbose_option = click.option(
+    "--verbose", "-v",
+    is_flag=True,
+    default=False,
+    help="Enable verbose output (API calls, pacing, per-message detail).",
+)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+@click.group()
+def cli() -> None:
+    """Export Slack channels to CSV, JSON, and download files."""
+
+
+@cli.command("export")
+@click.argument("channel", required=False)
+@_token_option
 @click.option(
     "--output",
     default=None,
@@ -651,13 +770,8 @@ def export_channel(
         "Cannot be combined with CHANNEL."
     ),
 )
-@click.option(
-    "--verbose", "-v",
-    is_flag=True,
-    default=False,
-    help="Enable verbose output (API calls, pacing, per-message detail).",
-)
-def main(
+@_verbose_option
+def cmd_export(
     channel: str | None,
     token: str,
     output: str | None,
@@ -678,6 +792,7 @@ def main(
         raise click.UsageError("Provide a CHANNEL argument or use --batch.")
 
     client = WebClient(token=token)
+    cache = load_channel_cache()
 
     if batch_file:
         channels = []
@@ -698,12 +813,13 @@ def main(
             click.echo(f"[{i}/{len(channels)}] Exporting '{ch}'...")
             click.echo(f"{'='*60}")
             try:
-                export_channel(client, token, ch)
+                export_channel(client, token, ch, cache)
             except (click.ClickException, click.Abort) as e:
                 msg = f"  ERROR exporting '{ch}': {e}"
                 click.echo(msg, err=True)
                 errors.append(msg)
 
+        save_channel_cache(cache)
         click.echo(f"\n{'='*60}")
         click.echo(f"Batch complete. {len(channels) - len(errors)}/{len(channels)} succeeded.")
         if errors:
@@ -712,7 +828,50 @@ def main(
                 click.echo(f"  {err}", err=True)
             sys.exit(1)
     else:
-        export_channel(client, token, channel, output)
+        export_channel(client, token, channel, cache, output)
+        save_channel_cache(cache)
+
+
+@cli.command("refresh-cache")
+@_token_option
+@_verbose_option
+def cmd_refresh_cache(token: str, verbose: bool) -> None:
+    """Fetch all visible channels from Slack and rebuild the local channel cache.
+
+    The cache is stored at downloads/.channel_cache.json and maps channel
+    names to IDs (and vice-versa). Running this command once means subsequent
+    export calls can resolve channel names without paginating conversations.list.
+    """
+    global _verbose
+    _verbose = verbose
+
+    client = WebClient(token=token)
+    click.echo("Fetching all channels to rebuild cache...")
+    cache = populate_channel_cache(client)
+    count = len(cache["by_id"])
+    click.echo(f"Done. Cached {count} channel(s) to {_cache_path()}.")
+
+
+# ---------------------------------------------------------------------------
+# Backwards-compatible entry point
+# ---------------------------------------------------------------------------
+# Allow the script to be called as before:
+#   uv run export_slack.py <channel>          (implicit "export" subcommand)
+#   uv run export_slack.py export <channel>   (explicit subcommand)
+#   uv run export_slack.py refresh-cache      (new subcommand)
+
+
+def main() -> None:
+    # If the first real argument looks like a subcommand, delegate to the group.
+    # Otherwise, inject "export" so the old single-channel usage still works.
+    args = sys.argv[1:]
+    known_subcommands = {"export", "refresh-cache", "--help", "-h"}
+    if args and args[0] in known_subcommands:
+        cli()
+    else:
+        # Prepend "export" so existing usage is unchanged
+        sys.argv.insert(1, "export")
+        cli()
 
 
 if __name__ == "__main__":
