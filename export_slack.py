@@ -29,6 +29,7 @@ MESSAGES_JSON = "messages.json"
 MESSAGES_CSV = "messages.csv"
 METADATA_JSON = "metadata.json"
 FILES_DIR = "files"
+FILES_JSON = "files.json"
 CHANNEL_CACHE_FILE = ".channel_cache.json"
 DOWNLOADS_DIR = Path("downloads")
 
@@ -501,6 +502,28 @@ def _file_dest_name(file_obj: dict) -> str:
     return f"{file_id}.{filetype}" if filetype else file_id
 
 
+def _load_files_manifest(output_dir: Path) -> dict[str, dict]:
+    """Load files.json manifest keyed by file ID, or return empty dict."""
+    path = output_dir / FILES_JSON
+    if path.exists():
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            click.echo(f"  Warning: {path} is corrupt ({exc}); starting fresh.", err=True)
+            path.unlink(missing_ok=True)
+    return {}
+
+
+def _save_files_manifest(output_dir: Path, manifest: dict[str, dict]) -> None:
+    """Atomically write files.json manifest."""
+    path = output_dir / FILES_JSON
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+    tmp.replace(path)
+
+
 def download_files(
     client: WebClient,
     messages: list[dict],
@@ -508,31 +531,52 @@ def download_files(
     checkpoint: dict,
     token: str,
 ) -> None:
-    """Download all files into <output_dir>/files/<file-id>.<filetype>."""
+    """Download all files into <output_dir>/files/ and track status in files.json.
+
+    Each entry in files.json has:
+      - id, name, filetype, pretty_type, size, url_private
+      - status: "downloaded" | "failed_permanent" | "failed_transient"
+      - local_path: relative path within output_dir (only when downloaded)
+      - error: human-readable error string (only on failure)
+      - mimetype, title from the Slack file object when available
+
+    HTTP 401/403 errors (common for Google Docs/Sheets) are marked
+    ``failed_permanent`` and never retried.  All other errors are
+    ``failed_transient`` and will be retried on the next run.
+    """
+    import urllib.error
     import urllib.request
 
     files_dir = output_dir / FILES_DIR
     files_dir.mkdir(parents=True, exist_ok=True)
 
-    downloaded: set[str] = set(checkpoint.get("downloaded_file_ids", []))
+    manifest = _load_files_manifest(output_dir)
 
-    # Collect all file objects across messages and their thread replies
-    all_file_objects: list[dict] = []
+    # Collect all file objects across messages and their thread replies.
+    seen: dict[str, dict] = {}
     for msg in _all_messages(messages):
         for f in msg.get("files", []):
             if isinstance(f, dict) and f.get("id") and f.get("url_private"):
-                all_file_objects.append(f)
+                seen[f["id"]] = f
 
-    pending = [
-        f for f in all_file_objects
-        if f["id"] not in downloaded
-        or not (files_dir / _file_dest_name(f)).exists()
-    ]
+    def _needs_download(file_obj: dict) -> bool:
+        fid = file_obj["id"]
+        entry = manifest.get(fid, {})
+        if entry.get("status") == "failed_permanent":
+            return False
+        if entry.get("status") == "downloaded":
+            return not (output_dir / entry["local_path"]).exists()
+        return True  # not yet attempted, or transient failure
+
+    pending = [f for f in seen.values() if _needs_download(f)]
+
+    total = len(seen)
+    already_done = total - len(pending)
     if not pending:
-        click.echo("  No new files to download.")
+        click.echo(f"  No new files to download ({already_done}/{total} already done).")
         return
 
-    click.echo(f"  Downloading {len(pending)} file(s)...")
+    click.echo(f"  Downloading {len(pending)} file(s) ({already_done}/{total} already done)...")
 
     for i, file_obj in enumerate(pending, 1):
         file_id = file_obj["id"]
@@ -540,24 +584,72 @@ def download_files(
         dest = files_dir / filename
         url = file_obj["url_private"]
 
-        vlog(f"File {i}/{len(pending)}: {filename} ({file_obj.get('pretty_type', '')} "
-             f"{file_obj.get('size', '')} bytes) from {url}")
+        # Build / update manifest entry with latest metadata from Slack.
+        entry: dict = manifest.get(file_id, {})
+        entry.update({
+            "id": file_id,
+            "name": file_obj.get("name", ""),
+            "filetype": file_obj.get("filetype", ""),
+            "pretty_type": file_obj.get("pretty_type", ""),
+            "mimetype": file_obj.get("mimetype", ""),
+            "title": file_obj.get("title", ""),
+            "size": file_obj.get("size"),
+            "url_private": url,
+        })
+
+        vlog(f"File {i}/{len(pending)}: {filename} ({entry.get('pretty_type')} "
+             f"{entry.get('size')} bytes) from {url}")
 
         try:
             req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
             with urllib.request.urlopen(req, timeout=60) as resp:
                 dest.write_bytes(resp.read())
+
+            local_path = f"{FILES_DIR}/{filename}"
+            entry["status"] = "downloaded"
+            entry["local_path"] = local_path
+            entry.pop("error", None)
+            file_obj["local_path"] = local_path
             click.echo(f"    Downloaded: {filename}")
+
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                entry["status"] = "failed_permanent"
+                entry["error"] = f"HTTP {e.code} {e.reason} (will not retry)"
+                click.echo(
+                    f"    Skipped (permanent): {filename} — HTTP {e.code} {e.reason}",
+                    err=True,
+                )
+            else:
+                entry["status"] = "failed_transient"
+                entry["error"] = f"HTTP {e.code} {e.reason}"
+                click.echo(
+                    f"    WARNING: {filename} — HTTP {e.code} {e.reason} (will retry)",
+                    err=True,
+                )
         except Exception as e:
+            entry["status"] = "failed_transient"
+            entry["error"] = str(e)
             click.echo(f"    WARNING: Failed to download {filename}: {e}", err=True)
-            continue
 
-        # Store the local path back onto the file object in-place
-        file_obj["local_path"] = f"{FILES_DIR}/{filename}"
+        manifest[file_id] = entry
+        _save_files_manifest(output_dir, manifest)
 
-        downloaded.add(file_id)
-        checkpoint["downloaded_file_ids"] = list(downloaded)
-        save_checkpoint(output_dir, checkpoint)
+        # Keep checkpoint in sync for backwards compatibility.
+        if entry["status"] == "downloaded":
+            downloaded_ids: list = checkpoint.get("downloaded_file_ids", [])
+            if file_id not in downloaded_ids:
+                downloaded_ids.append(file_id)
+            checkpoint["downloaded_file_ids"] = downloaded_ids
+            save_checkpoint(output_dir, checkpoint)
+
+    permanent = sum(1 for e in manifest.values() if e.get("status") == "failed_permanent")
+    transient = sum(1 for e in manifest.values() if e.get("status") == "failed_transient")
+    downloaded = sum(1 for e in manifest.values() if e.get("status") == "downloaded")
+    click.echo(
+        f"  Files: {downloaded} downloaded, {permanent} permanently skipped, "
+        f"{transient} transient failure(s)."
+    )
 
 
 def _all_messages(messages: list[dict]):
