@@ -575,35 +575,13 @@ def resolve_all_users(
 # ---------------------------------------------------------------------------
 
 
-@click.command()
-@click.argument("channel")
-@click.option(
-    "--token",
-    envvar="SLACK_API_TOKEN",
-    required=True,
-    help="Slack API token (or set SLACK_API_TOKEN env var).",
-)
-@click.option(
-    "--output",
-    default=None,
-    help="Output directory. Defaults to downloads/<channel_name>.",
-)
-@click.option(
-    "--verbose", "-v",
-    is_flag=True,
-    default=False,
-    help="Enable verbose output (API calls, pacing, per-message detail).",
-)
-def main(channel: str, token: str, output: str | None, verbose: bool) -> None:
-    """Export a Slack CHANNEL to CSV, JSON, and download its files.
-
-    CHANNEL can be a channel name (e.g. general) or a channel ID (e.g. C01234ABC).
-    """
-    global _verbose
-    _verbose = verbose
-
-    client = WebClient(token=token)
-
+def export_channel(
+    client: WebClient,
+    token: str,
+    channel: str,
+    output: str | None = None,
+) -> None:
+    """Export a single channel. Shared by single and batch modes."""
     # Resolve channel
     click.echo(f"Resolving channel '{channel}'...")
     channel_id, channel_name, channel_info = resolve_channel(client, channel)
@@ -647,6 +625,94 @@ def main(channel: str, token: str, output: str | None, verbose: bool) -> None:
     click.echo(f"  {output_dir / MESSAGES_JSON}")
     click.echo(f"  {output_dir / MESSAGES_CSV}")
     click.echo(f"  {output_dir / FILES_DIR}/")
+
+
+@click.command()
+@click.argument("channel", required=False)
+@click.option(
+    "--token",
+    envvar="SLACK_API_TOKEN",
+    required=True,
+    help="Slack API token (or set SLACK_API_TOKEN env var).",
+)
+@click.option(
+    "--output",
+    default=None,
+    help="Output directory. Defaults to downloads/<channel_name>. Ignored with --batch.",
+)
+@click.option(
+    "--batch",
+    "batch_file",
+    default=None,
+    type=click.Path(exists=True, readable=True, dir_okay=False),
+    help=(
+        "Path to a file containing one channel ID or name per line. "
+        "Lines starting with '#' and blank lines are ignored. "
+        "Cannot be combined with CHANNEL."
+    ),
+)
+@click.option(
+    "--verbose", "-v",
+    is_flag=True,
+    default=False,
+    help="Enable verbose output (API calls, pacing, per-message detail).",
+)
+def main(
+    channel: str | None,
+    token: str,
+    output: str | None,
+    batch_file: str | None,
+    verbose: bool,
+) -> None:
+    """Export a Slack CHANNEL to CSV, JSON, and download its files.
+
+    CHANNEL can be a channel name (e.g. general) or a channel ID (e.g. C01234ABC).
+    Use --batch to supply a file of channel IDs/names instead.
+    """
+    global _verbose
+    _verbose = verbose
+
+    if batch_file and channel:
+        raise click.UsageError("Provide either CHANNEL or --batch, not both.")
+    if not batch_file and not channel:
+        raise click.UsageError("Provide a CHANNEL argument or use --batch.")
+
+    client = WebClient(token=token)
+
+    if batch_file:
+        channels = []
+        with open(batch_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                channels.append(line)
+
+        if not channels:
+            raise click.ClickException(f"No channels found in '{batch_file}'.")
+
+        click.echo(f"Batch mode: {len(channels)} channel(s) from '{batch_file}'.")
+        errors = []
+        for i, ch in enumerate(channels, 1):
+            click.echo(f"\n{'='*60}")
+            click.echo(f"[{i}/{len(channels)}] Exporting '{ch}'...")
+            click.echo(f"{'='*60}")
+            try:
+                export_channel(client, token, ch)
+            except (click.ClickException, click.Abort) as e:
+                msg = f"  ERROR exporting '{ch}': {e}"
+                click.echo(msg, err=True)
+                errors.append(msg)
+
+        click.echo(f"\n{'='*60}")
+        click.echo(f"Batch complete. {len(channels) - len(errors)}/{len(channels)} succeeded.")
+        if errors:
+            click.echo("Failures:")
+            for err in errors:
+                click.echo(f"  {err}", err=True)
+            sys.exit(1)
+    else:
+        export_channel(client, token, channel, output)
 
 
 if __name__ == "__main__":
