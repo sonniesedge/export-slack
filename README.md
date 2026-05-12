@@ -1,4 +1,4 @@
-# export-slack
+# Export Slack
 
 Export Slack channels to JSON, CSV, and download file attachments.
 Supports incremental updates — re-running only fetches new messages.
