@@ -242,7 +242,14 @@ def resolve_channel(
         if channel_id in cache["by_id"]:
             vlog(f"Cache hit: {channel_id} -> '{cache['by_id'][channel_id]}'")
         vlog(f"'{channel_arg}' looks like a channel ID, calling conversations.info")
-        info = with_retry(client.conversations_info, channel=channel_id)
+        try:
+            info = with_retry(client.conversations_info, channel=channel_id)
+        except SlackApiError as e:
+            if e.response.get("error") == "channel_not_found":
+                raise click.ClickException(
+                    f"Channel '{channel_arg}' not found or not accessible."
+                )
+            raise
         pace()
         ch = info["channel"]
         update_channel_cache(cache, ch["id"], ch["name"])
@@ -255,7 +262,14 @@ def resolve_channel(
     if name_search in cache["by_name"]:
         cached_id = cache["by_name"][name_search]
         vlog(f"Cache hit: '{name_search}' -> {cached_id}, fetching full info")
-        info = with_retry(client.conversations_info, channel=cached_id)
+        try:
+            info = with_retry(client.conversations_info, channel=cached_id)
+        except SlackApiError as e:
+            if e.response.get("error") == "channel_not_found":
+                raise click.ClickException(
+                    f"Channel '{channel_arg}' not found or not accessible."
+                )
+            raise
         pace()
         ch = info["channel"]
         update_channel_cache(cache, ch["id"], ch["name"])
