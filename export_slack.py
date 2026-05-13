@@ -426,7 +426,8 @@ def fetch_all_messages(
         click.echo(f"  {new_count} new message(s) fetched; {len(messages)} total.")
     else:
         click.echo(f"  Fetched {len(messages)} top-level messages.")
-    return messages
+        new_count = len(messages)
+    return messages, new_count
 
 
 def fetch_thread_replies(
@@ -882,7 +883,7 @@ def export_channel(
 
     # --- Phase 1: Fetch channel history ---
     click.echo("\n[1/4] Fetching channel history...")
-    messages = fetch_all_messages(client, channel_id, checkpoint, output_dir)
+    messages, new_count = fetch_all_messages(client, channel_id, checkpoint, output_dir)
 
     # --- Phase 2: Fetch thread replies ---
     click.echo("\n[2/4] Fetching thread replies...")
@@ -912,7 +913,7 @@ def export_channel(
     checkpoint["next_cursor"] = None
     save_checkpoint(output_dir, checkpoint)
 
-    click.echo(f"\nDone. {len(messages)} messages exported to {output_dir.resolve()}")
+    click.echo(f"\nDone. {new_count} new message(s) ({len(messages)} total) exported to {output_dir.resolve()}")
     click.echo(f"  {output_dir / METADATA_JSON}")
     click.echo(f"  {output_dir / MESSAGES_JSON}")
     click.echo(f"  {output_dir / MESSAGES_CSV}")
