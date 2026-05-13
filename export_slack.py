@@ -353,6 +353,10 @@ def fetch_all_messages(
             with open(messages_path) as f:
                 data = json.load(f)
             for m in data.get("messages", []):
+                # Strip any replies that leaked into a previous export.
+                if m.get("thread_ts") and m["thread_ts"] != m["ts"]:
+                    vlog(f"Removing leaked reply from existing data: ts={m['ts']}")
+                    continue
                 existing[m["ts"]] = m
             vlog(f"Loaded {len(existing)} messages from disk")
         except (json.JSONDecodeError, OSError) as exc:
@@ -392,6 +396,12 @@ def fetch_all_messages(
         vlog(f"Page {page}: received {len(batch)} messages")
         for msg in batch:
             vlog(f"  ts={msg.get('ts')} user={msg.get('user')} text={msg.get('text', '')[:60]!r}")
+            # Slack occasionally returns thread replies in the main history
+            # feed (thread_ts != ts). Skip them here; they are fetched
+            # properly via conversations.replies.
+            if msg.get("thread_ts") and msg["thread_ts"] != msg["ts"]:
+                vlog(f"  Skipping reply leaked into history: ts={msg['ts']} thread_ts={msg['thread_ts']}")
+                continue
             if msg["ts"] not in existing:
                 new_count += 1
             existing[msg["ts"]] = msg
