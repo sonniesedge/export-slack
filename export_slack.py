@@ -581,8 +581,29 @@ def download_files(
     seen: dict[str, dict] = {}
     for msg in _all_messages(messages):
         for f in msg.get("files", []):
-            if isinstance(f, dict) and f.get("id") and f.get("url_private"):
-                seen[f["id"]] = f
+            if not isinstance(f, dict) or not f.get("id"):
+                continue
+            fid = f["id"]
+            if f.get("mode") == "tombstone":
+                # File was deleted; record as permanent failure so the test
+                # cross-check passes and we never attempt to download it.
+                if fid not in manifest:
+                    manifest[fid] = {
+                        "id": fid,
+                        "name": f.get("name", ""),
+                        "filetype": f.get("filetype", ""),
+                        "pretty_type": f.get("pretty_type", ""),
+                        "mimetype": f.get("mimetype", ""),
+                        "title": f.get("title", ""),
+                        "size": f.get("size", 0),
+                        "url_private": "",
+                        "status": "failed_permanent",
+                        "local_path": None,
+                        "error": "tombstone: file was deleted by the user",
+                    }
+                continue
+            if f.get("url_private"):
+                seen[fid] = f
 
     def _needs_download(file_obj: dict) -> bool:
         fid = file_obj["id"]
@@ -598,6 +619,7 @@ def download_files(
     total = len(seen)
     already_done = total - len(pending)
     if not pending:
+        _save_files_manifest(output_dir, manifest)
         click.echo(f"  No new files to download ({already_done}/{total} already done).")
         return
 
