@@ -565,8 +565,10 @@ def download_files(
       - error: human-readable error string (only on failure)
       - mimetype, title from the Slack file object when available
 
-    HTTP 401/403 errors (common for Google Docs/Sheets) are marked
-    ``failed_permanent`` and never retried.  All other errors are
+    HTTP 401/403/410 errors are marked ``failed_permanent`` and never retried.
+    401/403 are common for Google Docs/Sheets links; 410 means Slack has
+    purged the file from storage (common on free-tier workspaces).
+    All other errors are
     ``failed_transient`` and will be retried on the next run.
     """
     import urllib.error
@@ -660,7 +662,7 @@ def download_files(
             click.echo(f"    Downloaded: {filename}")
 
         except urllib.error.HTTPError as e:
-            if e.code in (401, 403):
+            if e.code in (401, 403, 410):
                 entry["status"] = "failed_permanent"
                 entry["error"] = f"HTTP {e.code} {e.reason} (will not retry)"
                 click.echo(
