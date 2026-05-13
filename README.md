@@ -70,6 +70,8 @@ dev-frontend
 # random-noise
 ```
 
+In batch mode, channels that are not found or inaccessible are skipped with an error message; all other channels continue to be exported. A summary of any failures is printed at the end.
+
 ### `refresh-cache`
 
 ```
