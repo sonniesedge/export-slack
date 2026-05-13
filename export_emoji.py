@@ -9,6 +9,8 @@ Usage:
     uv run export_emoji.py
     uv run export_emoji.py --token xoxb-...
     uv run export_emoji.py --output path/to/dir
+
+Reads SLACK_API_TOKEN from the environment (same as export_slack.py).
 """
 
 import os
@@ -67,9 +69,9 @@ def download_emoji(name: str, url: str, output_dir: Path) -> str:
 @click.command()
 @click.option(
     "--token",
-    envvar="SLACK_TOKEN",
+    envvar="SLACK_API_TOKEN",
     required=True,
-    help="Slack bot token (or set SLACK_TOKEN env var).",
+    help="Slack bot token (or set SLACK_API_TOKEN env var).",
 )
 @click.option(
     "--output",
