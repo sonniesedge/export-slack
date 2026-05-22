@@ -32,6 +32,7 @@ FILES_DIR = "files"
 FILES_JSON = "files.json"
 CHANNEL_CACHE_FILE = ".channel_cache.json"
 DOWNLOADS_DIR = Path("downloads")
+DM_DIR = DOWNLOADS_DIR / "_DMs"
 
 # Proactive rate-limit pacing: Slack recommends ≤1 req/s as a safe baseline.
 # We sleep BASE_DELAY seconds between requests, plus a small random jitter.
@@ -227,16 +228,21 @@ def resolve_channel(
     client: WebClient,
     channel_arg: str,
     cache: dict | None = None,
+    types: str = "public_channel,private_channel",
 ) -> tuple[str, str, dict]:
-    """Return (channel_id, channel_name, channel_info) from a channel name or ID.
+    """Return (channel_id, display_name, channel_info) from a channel name or ID.
+
+    Supports public channels, private channels, DMs (im), and group DMs (mpim).
+    The ``types`` parameter is passed directly to ``conversations.list`` when a
+    paginated name search is required.
 
     If ``cache`` is provided it is used as a fast-path to skip the API lookup
     where possible, and is updated with any newly resolved entries.
     """
     cache = cache if cache is not None else {"by_name": {}, "by_id": {}}
 
-    # Already an ID?
-    if re.match(r"^[CG][A-Z0-9]+$", channel_arg, re.IGNORECASE):
+    # Already an ID? Channel IDs start with C (public/private), D (DM), or G (group-DM/private).
+    if re.match(r"^[CDGW][A-Z0-9]+$", channel_arg, re.IGNORECASE):
         channel_id = channel_arg.upper()
         # We still need full channel info, but we can log a cache hit for the name.
         if channel_id in cache["by_id"]:
@@ -252,6 +258,11 @@ def resolve_channel(
             raise
         pace()
         ch = info["channel"]
+        # DMs and group DMs don't have a plain "name" field; use display name helper.
+        if ch.get("is_im") or ch.get("is_mpim"):
+            display_name = get_dm_display_name(client, ch, {})
+            update_channel_cache(cache, ch["id"], display_name)
+            return ch["id"], display_name, ch
         update_channel_cache(cache, ch["id"], ch["name"])
         return ch["id"], ch["name"], ch
 
@@ -276,7 +287,7 @@ def resolve_channel(
         return ch["id"], ch["name"], ch
 
     # Fall back to paginated search
-    vlog(f"Searching for channel by name '{name_search}' via conversations.list")
+    vlog(f"Searching for channel by name '{name_search}' via conversations.list (types={types})")
     cursor = None
     page = 0
     while True:
@@ -284,19 +295,28 @@ def resolve_channel(
         vlog(f"conversations.list page {page}")
         resp = with_retry(
             client.conversations_list,
-            types="public_channel,private_channel",
+            types=types,
             limit=200,
             cursor=cursor,
         )
         pace()
         for ch in resp["channels"]:
             # Opportunistically cache every channel we see
-            update_channel_cache(cache, ch["id"], ch["name"])
-            if ch["name"] == name_search:
+            if ch.get("is_im") or ch.get("is_mpim"):
+                # DM channels have no plain name; skip opportunistic caching here
+                # (they are found by ID, not name, in normal usage)
+                pass
+            else:
+                update_channel_cache(cache, ch["id"], ch["name"])
+            if ch.get("name") == name_search or ch.get("id") == name_search:
                 vlog(f"Found channel: {ch['id']}, fetching full info")
                 info = with_retry(client.conversations_info, channel=ch["id"])
                 pace()
                 ch_full = info["channel"]
+                if ch_full.get("is_im") or ch_full.get("is_mpim"):
+                    display_name = get_dm_display_name(client, ch_full, {})
+                    update_channel_cache(cache, ch_full["id"], display_name)
+                    return ch_full["id"], display_name, ch_full
                 update_channel_cache(cache, ch_full["id"], ch_full["name"])
                 return ch_full["id"], ch_full["name"], ch_full
         cursor = resp.get("response_metadata", {}).get("next_cursor")
@@ -322,6 +342,47 @@ def resolve_user(client: WebClient, user_id: str, users_cache: dict) -> str:
     vlog(f"Resolved {user_id} -> '{name}'")
     users_cache[user_id] = name
     return name
+
+
+def get_dm_display_name(client: WebClient, channel_info: dict, users_cache: dict) -> str:
+    """Return a filesystem-safe display name for a DM or group-DM channel.
+
+    - 1:1 DM  (is_im)   → ``dm-username``
+    - Group DM (is_mpim) → ``dm-user1+user2+user3`` (all members, sorted)
+
+    Users are resolved via ``resolve_user`` and cached in ``users_cache``.
+    Falls back to the channel ID if resolution fails entirely.
+    """
+    ch_id = channel_info.get("id", "unknown")
+
+    def _safe(name: str) -> str:
+        """Strip characters that are problematic in directory names."""
+        return re.sub(r"[^\w.\-]", "_", name).strip("_") or "unknown"
+
+    if channel_info.get("is_im"):
+        user_id = channel_info.get("user")
+        if not user_id:
+            return f"dm-{ch_id}"
+        name = resolve_user(client, user_id, users_cache)
+        return f"dm-{_safe(name)}"
+
+    if channel_info.get("is_mpim"):
+        # members list may or may not be present in the channel_info dict;
+        # fall back to conversations.members if needed.
+        members = channel_info.get("members", [])
+        if not members:
+            vlog(f"Fetching members for MPIM {ch_id}")
+            try:
+                resp = with_retry(client.conversations_members, channel=ch_id, limit=100)
+                pace()
+                members = resp.get("members", [])
+            except SlackApiError:
+                members = []
+        names = sorted(_safe(resolve_user(client, uid, users_cache)) for uid in members)
+        return "dm-" + "+".join(names) if names else f"dm-{ch_id}"
+
+    # Fallback: named channel (shouldn't normally reach here)
+    return channel_info.get("name") or ch_id
 
 
 # ---------------------------------------------------------------------------
@@ -881,21 +942,140 @@ def resolve_all_users(
 # ---------------------------------------------------------------------------
 
 
+def export_all_dms(client: WebClient, token: str) -> None:
+    """Discover every DM (im) and group DM (mpim) and export each one.
+
+    Requires the token to have ``im:read``, ``im:history``, ``mpim:read``,
+    and ``mpim:history`` scopes.
+    """
+    click.echo("Discovering DM and group DM conversations...")
+    conversations: list[dict] = []
+    cursor = None
+    page = 0
+    while True:
+        page += 1
+        vlog(f"conversations.list page {page} (im,mpim)")
+        resp = with_retry(
+            client.conversations_list,
+            types="im,mpim",
+            limit=200,
+            cursor=cursor,
+        )
+        pace()
+        conversations.extend(resp.get("channels", []))
+        cursor = resp.get("response_metadata", {}).get("next_cursor")
+        if not cursor:
+            break
+
+    if not conversations:
+        click.echo("No DM conversations found (check token scopes: im:read, mpim:read).")
+        return
+
+    click.echo(f"Found {len(conversations)} DM conversation(s).")
+
+    # We need a shared user cache so we don't re-resolve the same users for
+    # every conversation.
+    shared_users: dict = {}
+    errors: list[str] = []
+
+    for i, ch in enumerate(conversations, 1):
+        ch_id = ch["id"]
+        click.echo(f"\n{'='*60}")
+        click.echo(f"[{i}/{len(conversations)}] Resolving DM {ch_id}...")
+        click.echo(f"{'='*60}")
+
+        # Fetch full channel info so is_im / is_mpim / user fields are present.
+        try:
+            info_resp = with_retry(client.conversations_info, channel=ch_id)
+            pace()
+            ch_full = info_resp["channel"]
+        except SlackApiError as e:
+            msg = f"  ERROR fetching info for {ch_id}: {e.response.get('error', e)}"
+            click.echo(msg, err=True)
+            errors.append(msg)
+            continue
+
+        display_name = get_dm_display_name(client, ch_full, shared_users)
+        click.echo(f"  Display name: {display_name}")
+
+        output_dir = DM_DIR / display_name
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        checkpoint = load_checkpoint(output_dir)
+        checkpoint["channel_id"] = ch_id
+        checkpoint["channel_name"] = display_name
+        # Merge any users we've already resolved so we don't re-resolve them.
+        checkpoint.setdefault("users", {}).update(shared_users)
+        save_checkpoint(output_dir, checkpoint)
+
+        try:
+            click.echo("\n[1/4] Fetching history...")
+            messages, new_count = fetch_all_messages(client, ch_id, checkpoint, output_dir)
+
+            click.echo("\n[2/4] Fetching thread replies...")
+            messages = fetch_thread_replies(client, ch_id, messages, output_dir, checkpoint)
+
+            click.echo("\n[3/4] Resolving users...")
+            users_cache = resolve_all_users(client, messages, checkpoint, output_dir)
+            shared_users.update(users_cache)
+
+            click.echo("\n[4/4] Downloading files...")
+            download_files(client, messages, output_dir, checkpoint, token)
+
+            click.echo("\nWriting final exports...")
+            _write_json(output_dir, messages, users_cache)
+            write_csv(output_dir, messages, users_cache)
+            write_metadata(output_dir, ch_full, len(messages))
+
+            if messages:
+                newest_ts = max(m["ts"] for m in messages)
+            else:
+                newest_ts = str(time.time())
+            checkpoint["last_export_ts"] = newest_ts
+            checkpoint["next_cursor"] = None
+            save_checkpoint(output_dir, checkpoint)
+
+            click.echo(
+                f"\nDone. {new_count} new message(s) ({len(messages)} total) "
+                f"exported to {output_dir.resolve()}"
+            )
+        except (click.ClickException, click.Abort) as e:
+            msg = f"  ERROR exporting {display_name} ({ch_id}): {e}"
+            click.echo(msg, err=True)
+            errors.append(msg)
+
+    click.echo(f"\n{'='*60}")
+    click.echo(
+        f"All-DMs export complete. "
+        f"{len(conversations) - len(errors)}/{len(conversations)} succeeded."
+    )
+    if errors:
+        click.echo("Failures:")
+        for err in errors:
+            click.echo(f"  {err}", err=True)
+
+
 def export_channel(
     client: WebClient,
     token: str,
     channel: str,
     cache: dict,
     output: str | None = None,
+    types: str = "public_channel,private_channel",
 ) -> None:
     """Export a single channel. Shared by single and batch modes."""
     # Resolve channel
     click.echo(f"Resolving channel '{channel}'...")
-    channel_id, channel_name, channel_info = resolve_channel(client, channel, cache)
-    click.echo(f"  Channel: #{channel_name} ({channel_id})")
+    channel_id, channel_name, channel_info = resolve_channel(client, channel, cache, types=types)
+    click.echo(f"  Channel: {channel_name} ({channel_id})")
 
-    # Determine output directory
-    output_dir = Path(output) if output else DOWNLOADS_DIR / channel_name
+    # Determine output directory — DMs go under _DMs/, channels under downloads/
+    if output:
+        output_dir = Path(output)
+    elif channel_info.get("is_im") or channel_info.get("is_mpim"):
+        output_dir = DM_DIR / channel_name
+    else:
+        output_dir = DOWNLOADS_DIR / channel_name
     output_dir.mkdir(parents=True, exist_ok=True)
     click.echo(f"  Output directory: {output_dir.resolve()}")
 
@@ -991,28 +1171,80 @@ def cli() -> None:
         "Cannot be combined with CHANNEL."
     ),
 )
+@click.option(
+    "--type", "-t",
+    "conv_types",
+    default="public,private",
+    show_default=True,
+    help=(
+        "Comma-separated list of conversation types to include when resolving "
+        "a channel by name. Choices: public, private, dm, group_dm, all. "
+        "Example: --type dm,group_dm"
+    ),
+)
+@click.option(
+    "--all-dms",
+    is_flag=True,
+    default=False,
+    help=(
+        "Discover and export every DM (im) and group DM (mpim) the token can "
+        "access. Requires im:read, im:history, mpim:read, mpim:history scopes. "
+        "Cannot be combined with CHANNEL or --batch."
+    ),
+)
 @_verbose_option
 def cmd_export(
     channel: str | None,
     token: str,
     output: str | None,
     batch_file: str | None,
+    conv_types: str,
+    all_dms: bool,
     verbose: bool,
 ) -> None:
     """Export a Slack CHANNEL to CSV, JSON, and download its files.
 
     CHANNEL can be a channel name (e.g. general) or a channel ID (e.g. C01234ABC).
     Use --batch to supply a file of channel IDs/names instead.
+    Use --all-dms to export every DM and group DM conversation.
     """
     global _verbose
     _verbose = verbose
 
+    # --- Mutual-exclusion checks ---
+    if all_dms and (channel or batch_file):
+        raise click.UsageError("--all-dms cannot be combined with CHANNEL or --batch.")
     if batch_file and channel:
         raise click.UsageError("Provide either CHANNEL or --batch, not both.")
-    if not batch_file and not channel:
-        raise click.UsageError("Provide a CHANNEL argument or use --batch.")
+    if not all_dms and not batch_file and not channel:
+        raise click.UsageError("Provide a CHANNEL argument, --batch, or --all-dms.")
+
+    # --- Map friendly type names to Slack API type strings ---
+    _type_map = {
+        "public": "public_channel",
+        "private": "private_channel",
+        "dm": "im",
+        "group_dm": "mpim",
+    }
+    if conv_types.strip().lower() == "all":
+        slack_types = "public_channel,private_channel,im,mpim"
+    else:
+        parts = [t.strip().lower() for t in conv_types.split(",")]
+        unknown = [p for p in parts if p not in _type_map]
+        if unknown:
+            raise click.UsageError(
+                f"Unknown --type value(s): {', '.join(unknown)}. "
+                "Choose from: public, private, dm, group_dm, all."
+            )
+        slack_types = ",".join(_type_map[p] for p in parts)
 
     client = WebClient(token=token)
+
+    # --- --all-dms mode ---
+    if all_dms:
+        export_all_dms(client, token)
+        return
+
     cache = load_channel_cache()
 
     if batch_file:
@@ -1034,7 +1266,7 @@ def cmd_export(
             click.echo(f"[{i}/{len(channels)}] Exporting '{ch}'...")
             click.echo(f"{'='*60}")
             try:
-                export_channel(client, token, ch, cache)
+                export_channel(client, token, ch, cache, types=slack_types)
             except (click.ClickException, click.Abort) as e:
                 msg = f"  ERROR exporting '{ch}': {e}"
                 click.echo(msg, err=True)
@@ -1049,7 +1281,7 @@ def cmd_export(
                 click.echo(f"  {err}", err=True)
             sys.exit(1)
     else:
-        export_channel(client, token, channel, cache, output)
+        export_channel(client, token, channel, cache, output, types=slack_types)
         save_channel_cache(cache)
 
 
@@ -1087,6 +1319,7 @@ def main() -> None:
     # Otherwise, inject "export" so the old single-channel usage still works.
     args = sys.argv[1:]
     known_subcommands = {"export", "refresh-cache", "--help", "-h"}
+    # Also treat --all-dms at the top level as an implicit "export" subcommand.
     if args and args[0] in known_subcommands:
         cli()
     else:
